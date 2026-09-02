@@ -54,6 +54,81 @@ class ProtocolTests(unittest.TestCase):
         self.assertFalse(winauto.WinautoServer.allow_reuse_address)
 
 
+class AgentStartupTests(unittest.TestCase):
+    def test_loopback_listener_does_not_change_firewall(self):
+        with mock.patch.object(winauto.subprocess, "run") as run:
+            status = winauto._ensure_firewall_rule("127.0.0.1", 27889)
+        self.assertIsNone(status)
+        run.assert_not_called()
+
+    def test_non_loopback_listener_creates_a_persistent_firewall_rule(self):
+        completed = winauto.subprocess.CompletedProcess([], 0, stdout="created\n", stderr="")
+        with mock.patch.object(winauto.os, "name", "nt"):
+            with mock.patch.object(winauto, "_listener_is_loopback", return_value=False):
+                with mock.patch.object(winauto, "_find_powershell", return_value="powershell.exe"):
+                    with mock.patch.object(winauto, "_creation_flags", return_value=0):
+                        with mock.patch.object(winauto.subprocess, "run", return_value=completed) as run:
+                            status = winauto._ensure_firewall_rule("0.0.0.0", 27889)
+        self.assertEqual(status, "created")
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["WINAUTO_FIREWALL_PORT"], "27889")
+        self.assertEqual(environment["WINAUTO_FIREWALL_RULE_NAME"], "WinAuto-Agent-TCP-27889")
+
+    def test_agent_starts_a_listener_when_the_port_is_available(self):
+        fake_server = mock.MagicMock()
+        args = SimpleNamespace(host="127.0.0.1", port=27889)
+        with mock.patch.object(winauto, "WinautoServer", return_value=fake_server):
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = winauto._run_agent(args)
+        self.assertEqual(result, 0)
+        fake_server.serve_forever.assert_called_once_with()
+        fake_server.shutdown.assert_called_once_with()
+        fake_server.server_close.assert_called_once_with()
+
+    def test_agent_closes_listener_when_firewall_setup_fails(self):
+        fake_server = mock.MagicMock()
+        args = SimpleNamespace(host="0.0.0.0", port=27889)
+        error = io.StringIO()
+        with mock.patch.object(winauto, "WinautoServer", return_value=fake_server):
+            with mock.patch.object(winauto, "_ensure_firewall_rule", side_effect=RuntimeError("denied")):
+                with contextlib.redirect_stderr(error):
+                    result = winauto._run_agent(args)
+        self.assertEqual(result, 1)
+        self.assertIn("firewall setup failed", error.getvalue())
+        fake_server.serve_forever.assert_not_called()
+        fake_server.server_close.assert_called_once_with()
+
+    def test_agent_treats_an_existing_winauto_listener_as_success(self):
+        server = winauto.WinautoServer(("127.0.0.1", 0))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            args = SimpleNamespace(host="127.0.0.1", port=server.server_address[1])
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = winauto._run_agent(args)
+            self.assertEqual(result, 0)
+            self.assertIn("already listening", output.getvalue())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_agent_rejects_a_port_owned_by_another_process(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        try:
+            args = SimpleNamespace(host="127.0.0.1", port=listener.getsockname()[1])
+            error = io.StringIO()
+            with contextlib.redirect_stderr(error):
+                result = winauto._run_agent(args)
+            self.assertEqual(result, 1)
+            self.assertIn("already in use by another process", error.getvalue())
+        finally:
+            listener.close()
+
+
 class CommandTests(unittest.TestCase):
     def test_cmd_wraps_command_like_windows_cmd(self):
         command = winauto.build_command("cmd", ["dir", "C:\\"])

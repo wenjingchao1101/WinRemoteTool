@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -35,6 +37,66 @@ DEFAULT_PORT = 27889
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 MAX_SCREENSHOT_BYTES = 256 * 1024 * 1024
 READ_CHUNK_SIZE = 4096
+FIREWALL_COMMAND_TIMEOUT = 30
+FIREWALL_RULE_PREFIX = "WinAuto-Agent-TCP"
+
+FIREWALL_RULE_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+$port = [int]$env:WINAUTO_FIREWALL_PORT
+$ruleName = $env:WINAUTO_FIREWALL_RULE_NAME
+$displayName = "WinAuto Agent TCP $port"
+$description = "Allows inbound TCP connections to the WinAuto Agent on port $port."
+$rules = @(Get-NetFirewallRule -PolicyStore PersistentStore -Name $ruleName -ErrorAction SilentlyContinue)
+if ($rules.Count -eq 0) {
+    New-NetFirewallRule `
+        -PolicyStore PersistentStore `
+        -Name $ruleName `
+        -DisplayName $displayName `
+        -Description $description `
+        -Group 'WinAuto' `
+        -Enabled True `
+        -Profile Any `
+        -Direction Inbound `
+        -Action Allow `
+        -Protocol TCP `
+        -LocalPort $port | Out-Null
+    Write-Output 'created'
+    exit 0
+}
+
+$rule = $rules[0]
+$portFilters = @($rule | Get-NetFirewallPortFilter -ErrorAction Stop)
+$portMatches = $false
+foreach ($filter in $portFilters) {
+    if (("$($filter.Protocol)" -in @('TCP', '6')) -and ("$($filter.LocalPort)" -eq "$port")) {
+        $portMatches = $true
+        break
+    }
+}
+$ruleMatches = (
+    "$($rule.Enabled)" -eq 'True' -and
+    "$($rule.Profile)" -eq 'Any' -and
+    "$($rule.Direction)" -eq 'Inbound' -and
+    "$($rule.Action)" -eq 'Allow' -and
+    $portMatches
+)
+if ($ruleMatches) {
+    Write-Output 'existing'
+    exit 0
+}
+
+Set-NetFirewallRule `
+    -PolicyStore PersistentStore `
+    -Name $ruleName `
+    -Description $description `
+    -Enabled True `
+    -Profile Any `
+    -Direction Inbound `
+    -Action Allow `
+    -Protocol TCP `
+    -LocalPort $port | Out-Null
+Write-Output 'updated'
+"""
 
 
 def _strip_separator(command: Iterable[str]) -> List[str]:
@@ -922,15 +984,137 @@ def _run_interactive(args: argparse.Namespace, command: List[str]) -> int:
         return 1
 
 
+def _listener_is_loopback(host: str) -> bool:
+    normalized = host.strip().strip("[]").lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _ensure_firewall_rule(host: str, port: int) -> Optional[str]:
+    """Ensure a persistent inbound firewall rule for a non-loopback listener."""
+    if os.name != "nt" or _listener_is_loopback(host):
+        return None
+    if not 1 <= port <= 65535:
+        raise ValueError("firewall port must be between 1 and 65535")
+
+    rule_name = f"{FIREWALL_RULE_PREFIX}-{port}"
+    environment = os.environ.copy()
+    environment["WINAUTO_FIREWALL_PORT"] = str(port)
+    environment["WINAUTO_FIREWALL_RULE_NAME"] = rule_name
+    try:
+        result = subprocess.run(
+            [
+                _find_powershell(),
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                FIREWALL_RULE_SCRIPT,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            env=environment,
+            timeout=FIREWALL_COMMAND_TIMEOUT,
+            creationflags=_creation_flags(),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Windows Firewall configuration timed out") from exc
+
+    output_lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    status = output_lines[-1] if output_lines else ""
+    if result.returncode == 0 and status in {"created", "existing", "updated"}:
+        return status
+
+    detail_lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
+    detail = detail_lines[-1] if detail_lines else f"PowerShell exited with code {result.returncode}"
+    raise RuntimeError(
+        f"could not allow inbound TCP port {port} in Windows Firewall; "
+        f"run winauto agent from an Administrator terminal ({detail})"
+    )
+
+
+def _configure_agent_firewall(host: str, port: int) -> bool:
+    try:
+        status = _ensure_firewall_rule(host, port)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"winauto: firewall setup failed: {exc}", file=sys.stderr)
+        return False
+    if status == "created":
+        print(f"added Windows Firewall inbound rule for TCP port {port}", flush=True)
+    elif status == "updated":
+        print(f"updated Windows Firewall inbound rule for TCP port {port}", flush=True)
+    elif status == "existing":
+        print(f"Windows Firewall already allows TCP port {port}", flush=True)
+    return True
+
+
+def _agent_probe_target(host: str, port: int) -> str:
+    probe_host = "127.0.0.1" if host in {"", "0.0.0.0"} else host
+    if ":" in probe_host and not probe_host.startswith("["):
+        return f"[{probe_host}]:{port}"
+    return f"{probe_host}:{port}"
+
+
+def _probe_existing_agent(host: str, port: int, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
+    sock: Optional[socket.socket] = None
+    try:
+        sock = _connect_target(_agent_probe_target(host, port), timeout=timeout)
+        # _connect_target removes the connection timeout so normal operations
+        # can run indefinitely. A startup probe must remain bounded because an
+        # unrelated service may occupy the port and never answer our handshake.
+        sock.settimeout(timeout)
+        agent = _perform_handshake(sock)
+        send_frame(sock, {"operation": "ping"})
+        response = recv_frame(sock)
+        if not response or response.get("type") != "pong":
+            return None
+        pong_agent = response.get("agent")
+        return pong_agent if isinstance(pong_agent, dict) else agent
+    except (OSError, ProtocolError, ValueError, ConnectionError):
+        return None
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def _address_is_in_use(exc: OSError) -> bool:
+    return exc.errno in {errno.EADDRINUSE, 10048} or getattr(exc, "winerror", None) == 10048
+
+
 def _run_agent(args: argparse.Namespace) -> int:
     try:
         server = WinautoServer((args.host, args.port))
     except OSError as exc:
+        if _address_is_in_use(exc):
+            agent = _probe_existing_agent(args.host, args.port)
+            if agent is not None:
+                if not _configure_agent_firewall(args.host, args.port):
+                    return 1
+                hostname = str(agent.get("hostname") or "unknown-host")
+                print(
+                    f"winauto agent already listening on {args.host}:{args.port} "
+                    f"({hostname})",
+                    flush=True,
+                )
+                return 0
+            detail = "the port is already in use by another process"
+        else:
+            detail = "Windows did not allow the listener to be created"
         print(
-            f"winauto: unable to listen on {args.host}:{args.port}; "
-            f"the port may already be used by another Agent: {exc}",
+            f"winauto: unable to listen on {args.host}:{args.port}; {detail}: {exc}",
             file=sys.stderr,
         )
+        return 1
+    if not _configure_agent_firewall(args.host, args.port):
+        server.server_close()
         return 1
     print(f"winauto agent {VERSION} listening on {args.host}:{args.port}", flush=True)
     try:
