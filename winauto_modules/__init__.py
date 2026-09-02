@@ -2,5 +2,14 @@
 
 from .protocol import MAX_FRAME_SIZE, ProtocolError, recv_frame, send_frame
 from .file_transfer import push_root
+from .screenshot import Screenshot, capture_screenshot
 
-__all__ = ["MAX_FRAME_SIZE", "ProtocolError", "recv_frame", "send_frame", "push_root"]
+__all__ = [
+    "MAX_FRAME_SIZE",
+    "ProtocolError",
+    "Screenshot",
+    "capture_screenshot",
+    "recv_frame",
+    "send_frame",
+    "push_root",
+]

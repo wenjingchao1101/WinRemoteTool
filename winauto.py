@@ -27,11 +27,13 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from winauto_modules.file_transfer import FILE_CHUNK_SIZE, iter_files, push_root, read_chunks, safe_destination
 from winauto_modules.protocol import MAX_FRAME_SIZE, ProtocolError, recv_frame, send_frame
+from winauto_modules.screenshot import Screenshot, capture_screenshot
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DEFAULT_PORT = 27889
 MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+MAX_SCREENSHOT_BYTES = 256 * 1024 * 1024
 READ_CHUNK_SIZE = 4096
 
 
@@ -401,6 +403,33 @@ def _receive_push(request: Dict[str, Any], sock: socket.socket, send_lock: threa
                 pass
 
 
+def _stream_screenshot(sock: socket.socket, send_lock: threading.Lock) -> None:
+    screenshot = capture_screenshot()
+    payload = screenshot.png
+    if len(payload) > MAX_SCREENSHOT_BYTES:
+        raise ValueError(f"screenshot is too large: {len(payload)} bytes")
+
+    def emit(message: Dict[str, Any]) -> None:
+        with send_lock:
+            send_frame(sock, message)
+
+    emit(
+        {
+            "type": "screenshot_start",
+            "format": "png",
+            "width": screenshot.width,
+            "height": screenshot.height,
+            "size": len(payload),
+        }
+    )
+    digest = hashlib.sha256()
+    for offset in range(0, len(payload), FILE_CHUNK_SIZE):
+        chunk = payload[offset : offset + FILE_CHUNK_SIZE]
+        digest.update(chunk)
+        emit({"type": "screenshot_chunk", "data_b64": base64.b64encode(chunk).decode("ascii")})
+    emit({"type": "screenshot_end", "size": len(payload), "sha256": digest.hexdigest()})
+
+
 class WinautoRequestHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         try:
@@ -430,6 +459,16 @@ class WinautoRequestHandler(socketserver.BaseRequestHandler):
                 except (OSError, ProtocolError, ValueError, RuntimeError) as exc:
                     with send_lock:
                         send_frame(self.request, {"type": "error", "code": "push_failed", "message": str(exc)})
+                return
+            if operation == "screenshot":
+                try:
+                    _stream_screenshot(self.request, send_lock)
+                except (OSError, ProtocolError, ValueError, RuntimeError) as exc:
+                    with send_lock:
+                        send_frame(
+                            self.request,
+                            {"type": "error", "code": "screenshot_failed", "message": str(exc)},
+                        )
                 return
             if operation != "exec":
                 send_frame(self.request, {"type": "error", "code": "unsupported", "message": "unsupported operation"})
@@ -503,6 +542,127 @@ def _write_output(stream: str, data: bytes) -> None:
     output = sys.stderr.buffer if stream == "stderr" else sys.stdout.buffer
     output.write(data)
     output.flush()
+
+
+def _screenshot_destination(output: Optional[str]) -> Path:
+    default_name = time.strftime("screenshot-%Y%m%d-%H%M%S.png")
+    if not output:
+        return Path(default_name)
+    destination = Path(output)
+    if destination.is_dir() or output.endswith(("/", "\\")):
+        return destination / default_name
+    if not destination.suffix:
+        return destination.with_suffix(".png")
+    if destination.suffix.lower() != ".png":
+        raise ValueError("screenshot output must use a .png extension")
+    return destination
+
+
+def _save_screenshot(destination: Path, screenshot: Screenshot) -> None:
+    destination = destination.resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = destination.with_name(destination.name + ".winauto.part")
+    try:
+        temp_path.write_bytes(screenshot.png)
+        os.replace(temp_path, destination)
+    finally:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+
+
+def _screenshot_local(args: argparse.Namespace) -> int:
+    try:
+        screenshot = capture_screenshot()
+        destination = _screenshot_destination(args.output)
+        _save_screenshot(destination, screenshot)
+        print(
+            f"screenshot saved to {destination.resolve()} "
+            f"({screenshot.width}x{screenshot.height}, {len(screenshot.png)} bytes)"
+        )
+        return 0
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"winauto: screenshot failed: {exc}", file=sys.stderr)
+        return 1
+
+
+def _screenshot_remote(args: argparse.Namespace) -> int:
+    sock = _connect_target(args.target)
+    destination: Optional[Path] = None
+    temp_path: Optional[Path] = None
+    output_handle: Optional[Any] = None
+    digest = hashlib.sha256()
+    received_size = 0
+    expected_size = -1
+    width = 0
+    height = 0
+    try:
+        _perform_handshake(sock)
+        send_frame(sock, {"operation": "screenshot"})
+        while True:
+            response = recv_frame(sock)
+            if response is None:
+                raise ConnectionError("agent closed the connection before screenshot completed")
+            kind = response.get("type")
+            if kind == "screenshot_start":
+                if output_handle is not None:
+                    raise ValueError("received more than one screenshot_start message")
+                if response.get("format") != "png":
+                    raise ValueError(f"unsupported screenshot format: {response.get('format')}")
+                width = int(response.get("width", 0))
+                height = int(response.get("height", 0))
+                expected_size = int(response.get("size", -1))
+                if width <= 0 or height <= 0:
+                    raise ValueError("invalid screenshot dimensions")
+                if expected_size <= 0 or expected_size > MAX_SCREENSHOT_BYTES:
+                    raise ValueError(f"invalid screenshot size: {expected_size}")
+                destination = _screenshot_destination(args.output).resolve()
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                temp_path = destination.with_name(destination.name + ".winauto.part")
+                output_handle = temp_path.open("wb")
+            elif kind == "screenshot_chunk":
+                if output_handle is None:
+                    raise ValueError("received screenshot data before screenshot_start")
+                try:
+                    chunk = base64.b64decode(response.get("data_b64", ""), validate=True)
+                except (ValueError, TypeError) as exc:
+                    raise ValueError("invalid screenshot chunk encoding") from exc
+                if received_size + len(chunk) > expected_size:
+                    raise ValueError("screenshot data exceeds its advertised size")
+                output_handle.write(chunk)
+                digest.update(chunk)
+                received_size += len(chunk)
+            elif kind == "screenshot_end":
+                if output_handle is None or temp_path is None or destination is None:
+                    raise ValueError("received screenshot_end before screenshot_start")
+                output_handle.close()
+                output_handle = None
+                sent_size = int(response.get("size", -1))
+                sent_hash = str(response.get("sha256", ""))
+                if received_size != expected_size or sent_size != received_size or digest.hexdigest() != sent_hash:
+                    raise IOError("screenshot verification failed")
+                os.replace(temp_path, destination)
+                temp_path = None
+                print(f"screenshot saved to {destination} ({width}x{height}, {received_size} bytes)")
+                return 0
+            elif kind == "error":
+                print(f"{response.get('code', 'error')}: {response.get('message', '')}", file=sys.stderr)
+                return 1
+            else:
+                raise ValueError(f"unexpected screenshot message: {kind}")
+    except (OSError, ProtocolError, ValueError, ConnectionError) as exc:
+        print(f"winauto: screenshot failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if output_handle is not None:
+            output_handle.close()
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+        sock.close()
 
 
 def _execute_remote(args: argparse.Namespace, command: List[str]) -> int:
@@ -849,6 +1009,16 @@ def _build_parser() -> argparse.ArgumentParser:
     push_parser.add_argument("local", help="local file or directory path")
     push_parser.add_argument("remote", nargs="?", help="remote file or directory path (default: current directory)")
 
+    screenshot_parser = subparsers.add_parser(
+        "screenshot", help="capture the local or remote Windows desktop as PNG"
+    )
+    screenshot_parser.set_defaults(target=None)
+    screenshot_parser.add_argument(
+        "output",
+        nargs="?",
+        help="local PNG file or directory (default: timestamped file in current directory)",
+    )
+
     connect_parser = subparsers.add_parser("connect", help="check and remember an agent connection")
     connect_parser.add_argument("target", help="agent in HOST:PORT form")
     connect_parser.add_argument("--timeout", type=_non_negative_int, default=0, help="connection timeout in milliseconds; 0 means 10 seconds")
@@ -874,8 +1044,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps(_machine_info(), ensure_ascii=False, indent=2))
         return 0
     if args.global_target:
-        if args.subcommand not in {"exec", "cmd", "shell", "pull", "push"}:
-            parser.error("-s is only valid with exec, cmd, shell, pull, or push")
+        if args.subcommand not in {"exec", "cmd", "shell", "pull", "push", "screenshot"}:
+            parser.error("-s is only valid with exec, cmd, shell, pull, push, or screenshot")
         args.target = args.global_target
     if args.subcommand == "agent":
         return _run_agent(args)
@@ -891,6 +1061,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not args.target:
             parser.error("push requires -s HOST:PORT")
         return _push_remote(args)
+    if args.subcommand == "screenshot":
+        if args.target:
+            try:
+                return _screenshot_remote(args)
+            except (OSError, ValueError) as exc:
+                print(f"winauto: screenshot failed: {exc}", file=sys.stderr)
+                return 1
+        return _screenshot_local(args)
     command = _strip_separator(args.command)
     if args.subcommand == "shell":
         if not command and not args.program:

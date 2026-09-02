@@ -9,6 +9,7 @@ winauto.py              CLI、Agent 和命令分发
 winauto_modules/
   protocol.py                 长度前缀 JSON 通信
   file_transfer.py            文件枚举、分块读取和路径安全
+  screenshot.py               Windows 桌面捕获和 PNG 编码
 tests/                        单元测试
 ```
 
@@ -76,6 +77,23 @@ python .\winauto.py -s 127.0.0.1:27889 push .\logs "C:\\App\\logs"
 
 上传同样按 64 KiB 分块进行，Agent 会先写入 `.winauto.part`，校验大小和 SHA-256 后再替换远端目标文件。当前 Agent 无认证，上传会覆盖远端同名文件，请只在可信网络使用。
 
+截取本机或远程 Windows 桌面：
+
+```powershell
+# 截取本机桌面，默认保存为当前目录下带时间戳的 PNG
+python .\winauto.py screenshot
+
+# 截取本机桌面并指定文件名
+python .\winauto.py screenshot .\screenshots\local.png
+
+# 截取远程 Agent 桌面并下载到本机
+python .\winauto.py -s 127.0.0.1:27889 screenshot .\screenshots\remote.png
+```
+
+截图会覆盖整个虚拟桌面，因此多显示器会合并到一张 PNG。功能直接使用 Windows GDI 和 Python 标准库，不需要 Pillow；远程图片按 64 KiB 分块传输，完成大小和 SHA-256 校验后再替换目标文件。
+
+Agent 必须运行在已登录用户的交互式桌面会话中。作为 Windows Service 运行在 Session 0、桌面被锁定或安全桌面显示时，Windows 可能返回黑屏或拒绝截图。当前 Agent 没有身份认证，启用远程访问也意味着网络访问者可以读取屏幕内容，请务必使用防火墙限制来源。
+
 通过 Agent 执行远程命令：
 
 ```powershell
@@ -99,6 +117,7 @@ python .\winauto.py exec --program C:\Tools\job.exe -- --mode batch
 - 默认绑定回环地址，不接受外部机器连接。
 - 当前版本不包含 Token 或其他身份认证。
 - 传输协议使用长度前缀 JSON；输出数据使用 Base64 保持字节完整。
+- 远程截图可读取当前桌面显示内容，属于敏感操作。
 - 监听 `0.0.0.0` 后，任何能够访问端口的机器都可以执行命令。只能在受信任且有防火墙隔离的网络使用，不能直接暴露到公网。
 
 ## 打包 EXE
@@ -123,7 +142,7 @@ python .\build.py
 每个请求连接先发送：
 
 ```json
-{"type":"hello","client_version":"0.2.0"}
+{"type":"hello","client_version":"0.3.0"}
 ```
 
 握手成功后发送：
@@ -149,3 +168,11 @@ Agent 按顺序返回 `stdout`、`stderr` 和 `exit` 消息。`exit.code` 是目
 ```
 
 Agent 返回 `pull_start`、多个 `pull_file`/`pull_chunk`/`pull_file_end`，最后返回 `pull_done`。目录会递归传输，客户端会校验每个文件的大小和 SHA-256。
+
+请求远程截图时发送：
+
+```json
+{"operation":"screenshot"}
+```
+
+Agent 返回 `screenshot_start`、多个 `screenshot_chunk` 和 `screenshot_end`。开始消息包含 PNG 尺寸和字节数，结束消息包含 SHA-256；客户端校验完成后才会将临时文件替换为最终图片。

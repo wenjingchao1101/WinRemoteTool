@@ -1,13 +1,18 @@
 import contextlib
 import io
 import socket
+import struct
 import threading
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import winauto
 from winauto_modules.file_transfer import iter_files, push_root, safe_destination
+from winauto_modules.screenshot import Screenshot, encode_bgra_png
 
 
 class ProtocolTests(unittest.TestCase):
@@ -110,6 +115,73 @@ class CommandTests(unittest.TestCase):
     def test_interactive_shell_has_a_default_command(self):
         executable = winauto.build_command("cmd", [], interactive=True)
         self.assertEqual(executable, ["cmd.exe"] if winauto.os.name == "nt" else ["sh"])
+
+
+class ScreenshotTests(unittest.TestCase):
+    def test_bgra_pixels_are_encoded_as_rgb_png(self):
+        png = encode_bgra_png(
+            2,
+            1,
+            bytes(
+                [
+                    3,
+                    2,
+                    1,
+                    255,
+                    30,
+                    20,
+                    10,
+                    0,
+                ]
+            ),
+        )
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
+        offset = 8
+        idat = bytearray()
+        width = height = 0
+        while offset < len(png):
+            length = struct.unpack(">I", png[offset : offset + 4])[0]
+            chunk_type = png[offset + 4 : offset + 8]
+            data = png[offset + 8 : offset + 8 + length]
+            if chunk_type == b"IHDR":
+                width, height = struct.unpack(">II", data[:8])
+            elif chunk_type == b"IDAT":
+                idat.extend(data)
+            offset += 12 + length
+        self.assertEqual((width, height), (2, 1))
+        self.assertEqual(zlib.decompress(idat), b"\x00\x01\x02\x03\x0a\x14\x1e")
+
+    def test_screenshot_parser_accepts_local_and_remote_output(self):
+        local = winauto._build_parser().parse_args(["screenshot", "capture.png"])
+        remote = winauto._build_parser().parse_args(
+            ["-s", "127.0.0.1:27889", "screenshot", "capture.png"]
+        )
+        self.assertEqual(local.output, "capture.png")
+        self.assertEqual(remote.global_target, "127.0.0.1:27889")
+
+    def test_remote_screenshot_is_streamed_and_verified(self):
+        payload = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 300
+        screenshot = Screenshot(width=1920, height=1080, png=payload)
+        server = winauto.WinautoServer(("127.0.0.1", 0))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                destination = Path(temp_dir) / "remote.png"
+                args = SimpleNamespace(
+                    target=f"{server.server_address[0]}:{server.server_address[1]}",
+                    output=str(destination),
+                )
+                with mock.patch.object(winauto, "capture_screenshot", return_value=screenshot):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        result = winauto._screenshot_remote(args)
+                self.assertEqual(result, 0)
+                self.assertEqual(destination.read_bytes(), payload)
+                self.assertFalse(Path(str(destination) + ".winauto.part").exists())
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
 
 if __name__ == "__main__":
