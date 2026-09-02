@@ -1,0 +1,3 @@
+# WinAuto runtime uses only Python's standard library.
+# PyInstaller is needed only when building the standalone Windows executable.
+pyinstaller>=6.0,<7.0
