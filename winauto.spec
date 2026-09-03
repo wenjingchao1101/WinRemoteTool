@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['E:/work_software/AutomatorProject/WinAuto/winauto.py'],
+    ['E:\\work_software\\AutomatorProject\\WinRemoteTool\\winauto.py'],
     pathex=[],
     binaries=[],
     datas=[],

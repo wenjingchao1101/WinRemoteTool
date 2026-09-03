@@ -167,6 +167,41 @@ class CommandTests(unittest.TestCase):
     def test_separator_is_removed(self):
         self.assertEqual(winauto.build_command("raw", ["--", "python", "-V"]), ["python", "-V"])
 
+    def test_captured_windows_processes_do_not_inherit_the_console(self):
+        flags = winauto._creation_flags()
+        if winauto.os.name == "nt":
+            self.assertTrue(flags & winauto.subprocess.CREATE_NO_WINDOW)
+            self.assertTrue(flags & winauto.subprocess.CREATE_NEW_PROCESS_GROUP)
+        else:
+            self.assertEqual(flags, 0)
+
+    def test_gbk_command_output_is_transcoded_to_utf8(self):
+        gbk = "Windows IP 配置\r\n以太网适配器\r\n".encode("gbk")
+        split_at = gbk.index("配置".encode("gbk")) + 1
+        transcoder = winauto.CommandOutputTranscoder()
+        with mock.patch.object(winauto, "_windows_oem_encoding", return_value="gbk"):
+            encoded = transcoder.feed(gbk[:split_at]) + transcoder.feed(gbk[split_at:], final=True)
+            self.assertEqual(winauto.detect_command_encoding(gbk), "gbk")
+        self.assertEqual(encoded.decode("utf-8"), "Windows IP 配置\r\n以太网适配器\r\n")
+
+    def test_ascii_output_does_not_lock_encoding_before_non_ascii_bytes(self):
+        gbk = "Windows IP 配置\r\n".encode("gbk")
+        transcoder = winauto.CommandOutputTranscoder()
+        with mock.patch.object(winauto, "_windows_oem_encoding", return_value="gbk"):
+            first = transcoder.feed(b"Windows IP ")
+            encoded = first + transcoder.feed(gbk[len("Windows IP "):], final=True)
+        self.assertEqual(first, b"Windows IP ")
+        self.assertEqual(encoded.decode("utf-8"), "Windows IP 配置\r\n")
+        self.assertIsNone(winauto.detect_command_encoding(b"Windows IP ", final=False))
+
+    def test_utf8_command_output_is_left_as_utf8(self):
+        payload = "Windows IP 配置\n".encode("utf-8")
+        transcoder = winauto.CommandOutputTranscoder()
+        with mock.patch.object(winauto, "_windows_oem_encoding", return_value="gbk"):
+            encoded = transcoder.feed(payload, final=True)
+            self.assertEqual(winauto.detect_command_encoding(payload), "utf-8")
+        self.assertEqual(encoded, payload)
+
     def test_file_transfer_enumerates_files_and_blocks_traversal(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

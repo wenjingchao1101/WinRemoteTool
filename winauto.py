@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import codecs
 import errno
 import hashlib
 import ipaddress
@@ -183,7 +184,152 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
 def _creation_flags() -> int:
     if os.name != "nt":
         return 0
-    return int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    # Detach captured child processes from this console. Switching the parent
+    # to UTF-8 would otherwise make tools such as ipconfig emit English text.
+    return int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) | int(
+        getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    )
+
+
+def _configure_utf8_stdio() -> None:
+    """Make this process read and write UTF-8, including Windows consoles."""
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except (AttributeError, OSError):
+            pass
+    for stream in (sys.stdout, sys.stderr, sys.stdin):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError, AttributeError):
+            pass
+
+
+def _windows_oem_encoding() -> str:
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            oem = int(ctypes.windll.kernel32.GetOEMCP())
+        except (AttributeError, OSError, TypeError, ValueError):
+            oem = 0
+        if oem in {65001, 20127}:
+            return "utf-8"
+        if oem:
+            return f"cp{oem}"
+    return "gbk"
+
+
+def _drop_incomplete_utf8_tail(data: bytes) -> bytes:
+    if not data:
+        return data
+    index = len(data)
+    while index > 0 and index > len(data) - 4 and data[index - 1] & 0xC0 == 0x80:
+        index -= 1
+    if index == 0:
+        return b""
+    lead = data[index - 1]
+    if lead & 0x80 == 0:
+        expected = 1
+    elif lead & 0xE0 == 0xC0:
+        expected = 2
+    elif lead & 0xF0 == 0xE0:
+        expected = 3
+    elif lead & 0xF8 == 0xF0:
+        expected = 4
+    else:
+        return data
+    if len(data) - (index - 1) < expected:
+        return data[: index - 1]
+    return data
+
+
+def _contains_long_utf8_sequence(data: bytes) -> bool:
+    """True when data includes a 3 or 4 byte UTF-8 sequence, typical of CJK UTF-8."""
+    index = 0
+    length = len(data)
+    while index < length:
+        lead = data[index]
+        if lead < 0x80:
+            index += 1
+            continue
+        if lead & 0xE0 == 0xC0:
+            expected = 2
+        elif lead & 0xF0 == 0xE0:
+            expected = 3
+        elif lead & 0xF8 == 0xF0:
+            expected = 4
+        else:
+            return False
+        if index + expected > length:
+            return False
+        if any(byte & 0xC0 != 0x80 for byte in data[index + 1 : index + expected]):
+            return False
+        if expected >= 3:
+            return True
+        index += expected
+    return False
+
+
+def detect_command_encoding(data: bytes, final: bool = True) -> Optional[str]:
+    """Detect command output encoding, then callers transcode it to UTF-8.
+
+    Windows CMD tools emit the OEM code page. Those bytes are often also valid
+    UTF-8, so a successful UTF-8 decode is not enough. 3-byte UTF-8 sequences
+    are treated as UTF-8; otherwise Windows high-bit output is treated as OEM.
+    """
+    sample = data if final else _drop_incomplete_utf8_tail(data)
+    if not sample:
+        return "utf-8" if final else None
+    try:
+        sample.decode("utf-8")
+        utf8_ok = True
+    except UnicodeDecodeError:
+        utf8_ok = False
+    oem = _windows_oem_encoding()
+    if not utf8_ok:
+        return oem
+    if _contains_long_utf8_sequence(sample):
+        return "utf-8"
+    if any(byte >= 0x80 for byte in sample):
+        return oem
+    return "utf-8" if final else None
+
+
+class CommandOutputTranscoder:
+    """Convert a command's stdout/stderr byte stream to UTF-8."""
+
+    def __init__(self) -> None:
+        self._decoder: Optional[Any] = None
+        self._pending = bytearray()
+
+    def _lock(self, encoding: str, final: bool) -> bytes:
+        self._decoder = codecs.getincrementaldecoder(encoding)("replace")
+        buffered = bytes(self._pending)
+        self._pending.clear()
+        return self._decoder.decode(buffered, final=final).encode("utf-8")
+
+    def feed(self, data: bytes, final: bool = False) -> bytes:
+        if self._decoder is not None:
+            return self._decoder.decode(data, final=final).encode("utf-8")
+        self._pending.extend(data)
+        encoding = detect_command_encoding(bytes(self._pending), final=final)
+        if encoding is not None:
+            return self._lock(encoding, final)
+        # Still undecided: ASCII is valid UTF-8 and can be shown immediately.
+        sample = _drop_incomplete_utf8_tail(bytes(self._pending))
+        if not sample:
+            return b""
+        self._pending = bytearray(bytes(self._pending)[len(sample):])
+        return sample
 
 
 def run_process(
@@ -194,6 +340,8 @@ def run_process(
     on_output: Callable[[str, bytes], None],
 ) -> Tuple[int, bool]:
     env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     if env_overrides:
         env.update({str(key): str(value) for key, value in env_overrides.items()})
 
@@ -209,20 +357,28 @@ def run_process(
 
     byte_counts = {"stdout": 0, "stderr": 0}
     truncated = {"stdout": False, "stderr": False}
+    transcoders = {"stdout": CommandOutputTranscoder(), "stderr": CommandOutputTranscoder()}
+
+    def emit_utf8(name: str, data: bytes) -> None:
+        if not data:
+            return
+        remaining = MAX_OUTPUT_BYTES - byte_counts[name]
+        byte_counts[name] += len(data)
+        if remaining > 0:
+            on_output(name, data[:remaining])
+        if remaining < len(data) and not truncated[name]:
+            truncated[name] = True
+            on_output(name, b"\n[winauto: output truncated]\n")
 
     def pump(name: str, pipe: Any) -> None:
+        transcoder = transcoders[name]
         try:
             while True:
                 chunk = pipe.read(READ_CHUNK_SIZE)
                 if not chunk:
+                    emit_utf8(name, transcoder.feed(b"", final=True))
                     break
-                remaining = MAX_OUTPUT_BYTES - byte_counts[name]
-                byte_counts[name] += len(chunk)
-                if remaining > 0:
-                    on_output(name, chunk[:remaining])
-                if remaining < len(chunk) and not truncated[name]:
-                    truncated[name] = True
-                    on_output(name, b"\n[winauto: output truncated]\n")
+                emit_utf8(name, transcoder.feed(chunk))
         finally:
             pipe.close()
 
@@ -600,9 +756,18 @@ def _connect_target(target: str, timeout: float = 10.0) -> socket.socket:
     return sock
 
 
-def _write_output(stream: str, data: bytes) -> None:
-    output = sys.stderr.buffer if stream == "stderr" else sys.stdout.buffer
-    output.write(data)
+def _write_output(
+    stream: str,
+    data: bytes,
+    transcoder: Optional[CommandOutputTranscoder] = None,
+    final: bool = False,
+) -> None:
+    payload = transcoder.feed(data, final=final) if transcoder is not None else data
+    if not payload:
+        return
+    text = payload.decode("utf-8", errors="replace")
+    output = sys.stderr if stream == "stderr" else sys.stdout
+    output.write(text)
     output.flush()
 
 
@@ -747,6 +912,7 @@ def _execute_remote(args: argparse.Namespace, command: List[str]) -> int:
                 "timeout_ms": args.timeout,
             },
         )
+        transcoders = {"stdout": CommandOutputTranscoder(), "stderr": CommandOutputTranscoder()}
         while True:
             response = recv_frame(sock)
             if response is None:
@@ -755,11 +921,13 @@ def _execute_remote(args: argparse.Namespace, command: List[str]) -> int:
             kind = response.get("type")
             if kind in {"stdout", "stderr"}:
                 try:
-                    _write_output(kind, base64.b64decode(response.get("data_b64", "")))
+                    _write_output(kind, base64.b64decode(response.get("data_b64", "")), transcoders[kind])
                 except (ValueError, TypeError) as exc:
                     print(f"invalid output frame: {exc}", file=sys.stderr)
                     return 1
             elif kind == "exit":
+                for name, transcoder in transcoders.items():
+                    _write_output(name, b"", transcoder, final=True)
                 if response.get("timed_out"):
                     print("winauto: command timed out", file=sys.stderr)
                 return int(response.get("code", 1))
@@ -1163,7 +1331,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
     agent = subparsers.add_parser("agent", help="run a command execution agent")
-    agent.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
+    agent.add_argument("--host", default="0.0.0.0", help="bind address (default: 0.0.0.0)")
     agent.add_argument("--port", type=int, default=DEFAULT_PORT)
 
     exec_parser = subparsers.add_parser("exec", help="execute one command locally or on an agent")
@@ -1222,6 +1390,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    _configure_utf8_stdio()
     parser = _build_parser()
     args = parser.parse_args(argv)
     if getattr(args, "show_info", False):
